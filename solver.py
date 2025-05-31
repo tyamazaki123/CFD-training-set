@@ -6,6 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation,PillowWriter
 
+import SodExactSolution
+
 class SodShockTubeSolver:
     def __init__(self, config):
         """Initialize solver with parameters from config (ConfigParser section)."""
@@ -91,6 +93,8 @@ class SodShockTubeSolver:
         self.time = 0.0
         # Set history
         self.history = []
+        self.history_exact = []
+        self.exact = SodExactSolution(self.gamma)
         self.debug_loop = 0
         
     def compute_primitives(self):
@@ -128,7 +132,7 @@ class SodShockTubeSolver:
         log.write("Starting simulation...\n")
         # Main time integration loop
         for step in range(1, self.loop + 1):
-            print('Step : ',step)
+            if step % self.nout == 0:print("step = ",step)
             # Compute primitives from conserved vars
             self.compute_primitives()
             # Enforce boundary conditions on primitives
@@ -148,6 +152,7 @@ class SodShockTubeSolver:
             # Output results at specified intervals
             if step % self.nout == 0 or step == self.loop:
                 self.save_current_state()
+                self.save_current_exact_state
                 self.output(step)
         self.output_animation_gif()
         log.write("Simulation complete.\n")
@@ -160,6 +165,15 @@ class SodShockTubeSolver:
         p = self.gamma1 * (self.qc[2, 1:self.nxmax+1] - 0.5 * rho * u**2)
         e = p / (self.gamma1 * rho)
         self.history.append((rho, u, p, e))
+
+    def save_current_exact_state(self):
+        # Left side initial state
+        left = [1.0,0.0,1.0] # density, velocity, pressure
+        right = [0.125,0.0,1.0]
+        x0 = self.xlength / 2.0
+        rho,u,p,e = self.exact(rho,self.time,left,right,x0)
+        
+        self.history_exact.append((rho,u,p,e))
         
     def output(self, step):
         """Plot and save the current state (density, velocity, pressure, internal energy) to a PDF file."""
@@ -297,7 +311,7 @@ class RHS:
 
         nxmax = solver.nxmax
         gamma = solver.gamma
-        order = 1
+        order = 3
         qc = solver.qc
         dx = solver.dx
         dt = solver.dt
@@ -310,13 +324,16 @@ class RHS:
             for i in range(1, nxmax+1):
                 dq_minus = qc[m, i  ] - qc[m, i-1]
                 dq_plus  = qc[m, i+1] - qc[m, i  ]
-                # limitter value
-                r = dq_minus / (dq_plus + 1e-12)
                 if order == 1:
-                    phi = 0.0
+                    phi_l = 0.0
+                    phi_r = 0.0
                     kai = 0.0
                 else:
-                    phi = self.limiter(r, limiter_type)
+                    # limitter value
+                    r_l = (qc[m, i-1] - qc[m,-2]) / (qc[m,i  ] - qc[m,i-1] + 1e-12)
+                    r_r = (qc[m, i  ] - qc[m,-1]) / (qc[m,i+1] - qc[m,i  ] + 1e-12)
+                    phi_l = self.limiter(r_l, limiter_type)
+                    phi_r = self.limiter(r_r, limiter_type)
                     if order == 2:
                         kai = -1.0
                     elif order == 3:
@@ -325,21 +342,22 @@ class RHS:
                         print('MUSCL is first to third order schem.')
                         exit()
                 # MUSCL Interpolation
-                # qL[m, i] = qc[m, i] + 0.5 * phi * dq_plus
-                # qR[m, i] = qc[m, i+1] - 0.5 * phi * dq_plus
-                qL[m, i] = qc[m, i] + 0.25 * phi * ((1.0-kai)*dq_minus + (1.0+kai)*dq_plus)
-                qR[m, i] = qc[m, i+1] - 0.25 * phi * ((1.0-kai)*dq_plus  + (1.0+kai)*dq_minus)
-                # if solver.debug_loop == 1:print(i,qL[0,i],qL[1,i],qL[2,i])
+                qL[m, i] = qc[m, i] + 0.25 * phi_l * ((1.0-kai)*dq_minus + (1.0+kai)*dq_plus)
+                qR[m, i] = qc[m, i] - 0.25 * phi_r * ((1.0-kai)*dq_plus  + (1.0+kai)*dq_minus)
+                
             # first order interpolation at domain boundary
             qL[m,0] = qc[m,0]
-            qR[m,0] = qc[m,1]
-            qL[m,-1] = qc[m,-2]
+            qR[m,0] = qc[m,0]
+            qL[m,1] = qc[m,1]
+            qR[m,1] = qc[m,1]
+
+            qL[m,-2] = qc[m,-2]
+            qR[m,-2] = qc[m,-2]
+            qL[m,-1] = qc[m,-1]
             qR[m,-1] = qc[m,-1]
 
-        # if solver.debug_loop == 1:
-        #     for i in range(1,nxmax+1):
-        #         print(i,qL[0,i],qL[1,i],qL[2,i])
-        #     exit()
+        # if solver.debug_loop == 1: exit()
+        # solver.debug_loop += 1
             
         # Compute primitive values
         solver.prtvl = self.compute_intp_primitives(qL,solver)
@@ -376,6 +394,7 @@ class RHS:
         prtv[0] = rho
         prtv[1] = u
         prtv[2] = p
+
         # Safety check for negative pressure or density (optional)
         if np.any(rho[1:solver.nxmax+1] < 0) or np.any(p[1:solver.nxmax+1] < 0):
             raise RuntimeError("Negative density or pressure encountered in simulation!")
@@ -464,7 +483,7 @@ class RoeScheme:
             # Left (L) and Right (R) primitive states at the interface
             rL = solver.prtvl[0, j-1]; uL = solver.prtvl[1, j-1]; pL = solver.prtvl[2, j-1]
             rR = solver.prtvr[0, j];   uR = solver.prtvr[1, j];   pR = solver.prtvr[2, j]
-            # if solver.debug_loop==1:print(j,rL,uL,pL)
+
             # sound speeds
             cL = np.sqrt(γ * pL / rL)
             cR = np.sqrt(γ * pR / rR)
@@ -516,10 +535,6 @@ class RoeScheme:
                                                   + alpha3 * a3 * r_left)
             # Store flux at this interface
             solver.flux[:, j] = flux_face
-
-        # print(solver.debug_loop,'\n')
-        # if solver.debug_loop == 1:exit()
-        # solver.debug_loop += 1
 
         # Compute flux divergence for each cell j = 1..nx: (F_face_right - F_face_left)/dx
         solver.dflx[:, 1:nx+1] = (solver.flux[:, 2:nx+2] - solver.flux[:, 1:nx+1]) / solver.dx
