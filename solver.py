@@ -4,9 +4,9 @@ import configparser
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation,PillowWriter
+from matplotlib.animation import FuncAnimation,PillowWriter,FFMpegWriter
 
-import SodExactSolution
+from exact import SodExactSolution
 
 class SodShockTubeSolver:
     def __init__(self, config):
@@ -95,6 +95,11 @@ class SodShockTubeSolver:
         self.history = []
         self.history_exact = []
         self.exact = SodExactSolution(self.gamma)
+        self.rho_exact = np.zeros(self.nxmax)
+        self.u_exact  = np.zeros(self.nxmax)
+        self.p_exact = np.zeros(self.nxmax)
+        self.e_int_exact = np.zeros(self.nxmax)
+
         self.debug_loop = 0
         
     def compute_primitives(self):
@@ -125,6 +130,7 @@ class SodShockTubeSolver:
         ini_cond.apply(self)
         # Output initial state
         self.output(step=0)
+
         # Log initial info
         log.write(f"Loop = {self.loop}\n")
         log.write(f"dx = {self.dx:.2e}\n")
@@ -152,7 +158,7 @@ class SodShockTubeSolver:
             # Output results at specified intervals
             if step % self.nout == 0 or step == self.loop:
                 self.save_current_state()
-                self.save_current_exact_state
+                self.save_current_exact_state()
                 self.output(step)
         self.output_animation_gif()
         log.write("Simulation complete.\n")
@@ -164,16 +170,25 @@ class SodShockTubeSolver:
         u = self.qc[1, 1:self.nxmax+1] / rho
         p = self.gamma1 * (self.qc[2, 1:self.nxmax+1] - 0.5 * rho * u**2)
         e = p / (self.gamma1 * rho)
+    
         self.history.append((rho, u, p, e))
 
     def save_current_exact_state(self):
         # Left side initial state
         left = [1.0,0.0,1.0] # density, velocity, pressure
-        right = [0.125,0.0,1.0]
+        right = [0.125,0.0,0.1]
         x0 = self.xlength / 2.0
-        rho,u,p,e = self.exact(rho,self.time,left,right,x0)
+        dx = self.xlength / self.nxmax
+        x = np.arange(0.0, self.xlength, dx)
         
-        self.history_exact.append((rho,u,p,e))
+        rho,u,p,e_int = self.exact.solve(x,self.time,left,right,x0)
+
+        self.rho_exact = rho
+        self.u_exact  = u
+        self.p_exact = p
+        self.e_int_exact = e_int
+    
+        self.history_exact.append((rho,u,p,e_int))
         
     def output(self, step):
         """Plot and save the current state (density, velocity, pressure, internal energy) to a PDF file."""
@@ -187,22 +202,33 @@ class SodShockTubeSolver:
         x = np.linspace(1, self.nxmax, self.nxmax) / self.nxmax * self.xlength
         # Create a 2x2 subplot for the four variables
         fig, axs = plt.subplots(2, 2, figsize=(8, 6))
-        axs[0, 0].plot(x, rho, color='C0')
+        axs[0, 0].plot(x, rho, color='C0',label='CFD')
         axs[0, 0].set_title("Density")
         axs[0, 0].set_xlabel("Position x")
         axs[0, 0].set_ylabel("Density ρ")
-        axs[0, 1].plot(x, u, color='C1')
+        axs[0, 1].plot(x, u, color='C1',label='CFD')
         axs[0, 1].set_title("Velocity")
         axs[0, 1].set_xlabel("Position x")
         axs[0, 1].set_ylabel("Velocity u")
-        axs[1, 0].plot(x, p, color='C2')
+        axs[1, 0].plot(x, p, color='C2',label='CFD')
         axs[1, 0].set_title("Pressure")
         axs[1, 0].set_xlabel("Position x")
         axs[1, 0].set_ylabel("Pressure p")
-        axs[1, 1].plot(x, e_int, color='C3')
+        axs[1, 1].plot(x, e_int, color='C3',label='CFD')
         axs[1, 1].set_title("Internal Energy")
         axs[1, 1].set_xlabel("Position x")
-        axs[1, 1].set_ylabel("Internal e")
+        axs[1, 1].set_ylabel("Internal energy e")
+
+        # Analytical solution
+        axs[0, 0].plot(x, self.rho_exact, color='C0',ls='dotted',lw=2.0,label='Analysis')
+        axs[0, 1].plot(x, self.u_exact, color='C1',ls='dotted',lw=2.0,label='Analysis')
+        axs[1, 0].plot(x, self.p_exact, color='C2',ls='dotted',lw=2.0,label='Analysis')
+        axs[1, 1].plot(x, self.e_int_exact, color='C3',ls='dotted',lw=2.0,label='Analysis')
+        axs[0, 0].legend()
+        axs[0, 1].legend()
+        axs[1, 0].legend()
+        axs[1, 1].legend()
+        
         fig.suptitle(f"Step {step} (Time = {self.time:.4f})")
         fig.tight_layout(rect=[0, 0.03, 1, 0.95])
         # Save to PDF in output directory
@@ -212,7 +238,7 @@ class SodShockTubeSolver:
         # (No need to explicitly cite the image source in text; it will be in output folder)
 
     def output_animation_gif(self):
-        """export GIF file from saved history"""
+        """Export GIF file from saved history (CFD+Analysis)"""
         if not self.history:
             return  # No data
 
@@ -221,10 +247,16 @@ class SodShockTubeSolver:
         fig, axs = plt.subplots(2, 2, figsize=(8, 6))
 
         lines = []
+        lines_exact = []
         colors = ['C0','C1','C2','C3']
         for ax,color in zip(axs.flat,colors):
-            line, = ax.plot([], [], lw=2,color=color)
+            # CFD
+            line, = ax.plot([], [], lw=2,color=color,label="CFD")
             lines.append(line)
+            # Analysis
+            line_ex, = ax.plot([], [], lw=2,color=color,ls='dotted',label="Analysis")
+            lines_exact.append(line_ex)
+
         titles = ["Density", "Velocity", "Pressure", "Internal Energy"]
         ylabels = [r"$\rho$", r"$u$", r"$p$", r"$e$"]
         for ax, title, ylabel in zip(axs.flat, titles, ylabels):
@@ -233,32 +265,52 @@ class SodShockTubeSolver:
                 ax.set_ylim(1.5, 2.9)
             else:
                 ax.set_ylim(0,1.1)
+
             ax.set_title(title)
             ax.set_xlabel("Position x")
             ax.set_ylabel(ylabel)
+            ax.legend()  # show legend
 
         fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-        
+    
         def init():
-            for line in lines:
+            for line in lines + lines_exact:
                 line.set_data([], [])
-            return lines
+            return lines + lines_exact
 
         def animate(i):
+            # CFD
             rho, u, p, e = self.history[i]
             lines[0].set_data(x, rho)
             lines[1].set_data(x, u)
             lines[2].set_data(x, p)
             lines[3].set_data(x, e)
+            # Analysis
+            rho_ex, u_ex, p_ex, e_ex = self.history_exact[i]
+            lines_exact[0].set_data(x, rho_ex)
+            lines_exact[1].set_data(x, u_ex)
+            lines_exact[2].set_data(x, p_ex)
+            lines_exact[3].set_data(x, e_ex)
             fig.suptitle(f"Step {i*self.nout} (Frame {i+1}/{len(self.history)})")
-            return lines
+
+            return lines + lines_exact
 
         anim = FuncAnimation(fig, animate, init_func=init, frames=len(self.history), interval=200, blit=True)
         gif_path = "output/sod_shock_tube.gif"
         anim.save(gif_path, writer=PillowWriter(fps=5))
         plt.close(fig)
         print(f"Export animation gif: {gif_path}")
+
+        # save MP4
+        mp4_path = "output/sod_shock_tube.mp4"
+        try:
+            anim.save(mp4_path, writer=FFMpegWriter(fps=5))
+            print(f"Export animation mp4: {mp4_path}")
+        except Exception as e:
+            print(f"MP4 export failed: {e}")
+        plt.close(fig)
         
+       
 class InitialCondition:
     """Initialize the shock tube problem (Sod shock tube initial states)."""
     def apply(self, solver):
@@ -283,6 +335,12 @@ class InitialCondition:
         # Copy initial state to qc_old
         solver.qc_old[:, :] = solver.qc[:, :]
         solver.time = 0.0  # start time
+
+        # Exact
+        solver.rho_exact = solver.qc[0, 1:-1]
+        solver.u_exact  = solver.qc[1, 1:-1] / solver.rho_exact
+        solver.p_exact =  solver.gamma1 * (solver.qc[2, 1:-1] - 0.5 * solver.rho_exact * solver.u_exact**2)
+        solver.e_int_exact = solver.p_exact * solver.gamma1v / solver.qc[0, 1:-1]
         
 class BoundaryCondition:
     """Apply reflective (wall) boundary conditions: zero velocity at walls."""
@@ -355,9 +413,6 @@ class RHS:
             qR[m,-2] = qc[m,-2]
             qL[m,-1] = qc[m,-1]
             qR[m,-1] = qc[m,-1]
-
-        # if solver.debug_loop == 1: exit()
-        # solver.debug_loop += 1
             
         # Compute primitive values
         solver.prtvl = self.compute_intp_primitives(qL,solver)
