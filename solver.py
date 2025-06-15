@@ -542,7 +542,7 @@ class RoeScheme:
             # sound speeds
             cL = np.sqrt(γ * pL / rL)
             cR = np.sqrt(γ * pR / rR)
-            # Enthalpies H = (E + p)/ρ = c^2/(γ-1) + 0.5*u^2
+            # Total Enthalpies H = (E + p)/ρ=c^2/(γ-1) + 0.5*u^2
             HL = cL**2 * solver.gamma1v + 0.5 * uL**2
             HR = cR**2 * solver.gamma1v + 0.5 * uR**2
             # Roe average state
@@ -561,7 +561,7 @@ class RoeScheme:
             # Contact wave (lambda1 = u_t)
             alpha1 = dr - dp / (c_t**2)
             # Right-moving acoustic wave (lambda2 = u_t + c_t)
-            alpha2 = (dp + (r_t := sqrt_rL * sqrt_rR) * c_t * du) / (2 * c_t**2)
+            alpha2 = (dp + (r_t := sqrt_rL * sqrt_rR) * c_t * du) / (2 * c_t**2) # walrus operator (over python3.8)
             # Left-moving acoustic wave (lambda3 = u_t - c_t)
             alpha3 = (dp - r_t * c_t * du) / (2 * c_t**2)
             # Eigenvalues (characteristic speeds)
@@ -600,7 +600,6 @@ class RoeScheme:
         return res
 
 
-
 class SLAUScheme:
     """
     SLAU (Simple Low-dissipation AUSM) scheme for 1D Euler equations (Shima & Kitamura, JCP 2011).
@@ -612,13 +611,13 @@ class SLAUScheme:
         dt = solver.dt
         qc = solver.qc
 
-        # 保存量の新しい配列
+        # New array for conserved variables (for update)
         qc_new = np.zeros_like(qc)
         flux = np.zeros((3, nx + 1))
 
-        # ゴーストセルを含めた状態で数値流束を計算
+        # Compute numerical fluxes including ghost cells
         for i in range(nx + 1):
-            # 左・右セル
+            # left and right cell states
             rho_L = qc[0, i]
             u_L = qc[1, i] / rho_L
             E_L = qc[2, i]
@@ -633,14 +632,14 @@ class SLAUScheme:
             HR = (E_R + p_R) / rho_R
             a_R = np.sqrt(gamma * p_R / rho_R)
 
-            # 基準音速
+            # Reference soud speed at interface
             a_face = min(a_L, a_R)
 
-            # マッハ数
+            # mach number
             M_L = u_L / a_face
             M_R = u_R / a_face
 
-            # SLAU補間: マッハ関数
+            # SLAU interpolation : Mach number functions
             def M_plus(M):   # for 0 ≦ M
                 return 0.25*(M+1)**2   if abs(M) < 1 else max(M, 0)
             def M_minus(M): # for M ≦ 0
@@ -650,26 +649,26 @@ class SLAUScheme:
             mass_flux = a_face * (rho_L * M_plus(M_L) + rho_R * M_minus(M_R))
 
             # Pressure flux: (Shima 2011 eqn. (27))
-            alpha = 0.1875  # 論文推奨値（可調整）
+            alpha = 0.1875  # recommended value in the paper (can be tuned)
             beta = 0.125
             f_p = 0.5 * (1 + np.sign(M_L) * (1 - 2 * alpha * M_L * M_R))
             pressure_flux = f_p * p_L + (1 - f_p) * p_R
 
-            # 付加項: 圧力のスムージング
+            # Additional term : pressure smooting
             phi = 0.5 * (1 + np.tanh(beta * (M_L - M_R)))
             pressure_flux = phi * p_L + (1 - phi) * p_R
 
-            # 保存量の数値流束
+            # Numerical fluxes for conserved variables
             # F = [mass, momentum, energy]
             flux[0, i] = mass_flux
             flux[1, i] = mass_flux * ((u_L if mass_flux > 0 else u_R)) + pressure_flux
             flux[2, i] = mass_flux * ((HL if mass_flux > 0 else HR))
 
-        # 保存量の更新（内点のみ、境界は外部で処理）
+        # Update conserved variables for interior points only (boundaries are handled externally)
         for j in range(1, nx + 1):
             qc_new[:, j] = qc[:, j] - dt/dx * (flux[:, j] - flux[:, j-1])
 
-        # 更新
+        # Update solver state
         solver.qc[:, 1:nx+1] = qc_new[:, 1:nx+1]
         res = np.linalg.norm(qc_new - qc)
         return res
