@@ -1,6 +1,6 @@
 # Environment
-Python
-(Module list are described in requirements.txt)
+Python3.x
+(Recommended-modules list are described in requirements.txt)
 
 ## Recommend using venv
 $python3 -m venv venv0  
