@@ -35,6 +35,10 @@ class SodShockTubeSolver:
                 self.rhs_code = -1
             elif rhs_opt in ["1","muscl","MUSCL","MUSL"]:
                 self.rhs_code = 1
+            elif rhs_opt in ["2","weno","WENO"]:
+                self.rhs_code = 2
+            elif rhs_opt in ["3","kep","KEP"]:
+                self.rhs_code = 3
             else:
                 raise ValueError(f"Unknown high-order scheme: {rhs_opt}")
 
@@ -52,12 +56,8 @@ class SodShockTubeSolver:
                 scheme_code = 2
             elif scheme_opt in ["3", "slau"]:
                 scheme_code = 3
-            elif scheme_opt in ["4", "weno"]:
+            elif scheme_opt in ["4", "kep"]:
                 scheme_code = 4
-            elif scheme_opt in ["5", "kep"]:
-                scheme_code = 5
-            elif scheme_opt in ["6", "keep"]:
-                scheme_code = 6
             else:
                 raise ValueError(f"Unknown scheme: {scheme_opt}")
         # Choose scheme class
@@ -70,13 +70,29 @@ class SodShockTubeSolver:
         elif scheme_code == 3:
             self.scheme = SLAUScheme()
         elif scheme_code == 4:
-            self.scheme = WENOscheme()
-        elif scheme_code == 5:
-            self.scheme = KEPscheme()
-        elif scheme_code == 6:
-            self.scheme = KEEPscheme()
+            if self.rhs_code == 3:
+                self.scheme = KEPScheme()
+            else:
+                raise ValueError(f"rhs must set to be KEP (3).")
         else:
             raise ValueError(f"Unsupported scheme code: {scheme_code}")
+
+        # Choose time integration
+        lhs_opt = str(config.get("lhs")).lower()
+        if lhs_opt.isdigit():
+            self.lhs_type = int(lhs_opt)
+        else:
+            # Map scheme name to code
+            if scheme_opt in ["1", "rk1", "RK1" "euler"]:
+                self.lhs_type = 1
+            elif scheme_opt in ["2", "rk2", "RK2"]:
+                self.lhs_type = 2
+            elif scheme_opt in ["3", "rk3", "RK3"]:
+                self.lhs_type = 3
+            else:
+                raise ValueError(f"Unknown scheme: {lhs_type}")
+
+    # ... output, logging, etc ...
         # Spatial domain
         self.xlength = config.getfloat("xlength") if "xlength" in config else 1.0
         self.dx = self.xlength / self.nxmax
@@ -118,16 +134,41 @@ class SodShockTubeSolver:
         self.prtv[1] = u
         self.prtv[2] = p
         # Safety check for negative pressure or density (optional)
-        if np.any(rho[1:self.nxmax+1] < 0) or np.any(p[1:self.nxmax+1] < 0):
+        neg_rho_idx = np.where(rho[1:self.nxmax+1] <= 0)[0]
+        neg_p_idx   = np.where(p[1:self.nxmax+1] <= 0)[0]
+
+        if len(neg_rho_idx) > 0 or len(neg_p_idx) > 0:
+            if len(neg_rho_idx) > 0:
+                print("Negative density at cells:", neg_rho_idx + 1, "values:", rho[1:self.nxmax+1][neg_rho_idx])
+            if len(neg_p_idx) > 0:
+                print("Negative pressure at cells:", neg_p_idx + 1, "values:", p[1:self.nxmax+1][neg_p_idx])
             raise RuntimeError("Negative density or pressure encountered in simulation!")
 
         self.prtvl = self.prtv
         self.prtvr = self.prtv
+
+    def check_cfl(self,qc, gamma, dx, dt):
+        """
+        Check CFL number and print a warning if dt exceeds CFL limit.
+        """
+        rho = qc[0]
+        u = qc[1] / rho
+        E = qc[2]
+        p = (gamma - 1.0) * (E - 0.5 * rho * u**2)
+        a = np.sqrt(gamma * p / rho)
+        max_speed = np.max(np.abs(u) + a)
+        cfl = max_speed * dt / dx
+        if cfl > 1.0:
+            print(f"Warning: CFL number too large ({cfl:.3f} > 1.0). Simulation may be unstable.")
+        else:
+            print(f"CFL number = {cfl:.3f}")
         
-    def run(self, ini_cond, boundary, rhs, log):
+    def run(self, ini_cond, boundary, rhs, lhs, log):
         """Execute the time-stepping simulation."""
         # Apply initial condition
         ini_cond.apply(self)
+        # Check CFL
+        self.check_cfl(self.qc, self.gamma, self.dx, self.dt)
         # Output initial state
         self.output(step=0)
 
@@ -146,7 +187,15 @@ class SodShockTubeSolver:
             # Enhance the spatial order for conservatives
             rhs.apply(self)
             # Perform one step of the selected scheme
-            res = self.scheme.step(self)
+            if self.lhs_type == 1:
+                res = lhs.tvd_rk1(self, self.scheme)
+            elif self.lhs_type == 2:
+                res = lhs.tvd_rk2(self, self.scheme)
+            elif self.lhs_type == 3:
+                res = lhs.tvd_rk3(self, self.scheme)
+            else:
+                raise ValueError("Invalid lhs type (should be 1/2/3)")
+
             # Update time and previous state
             self.time += self.dt
             self.qc_old[:, :] = self.qc[:, :]
@@ -359,17 +408,21 @@ class RHS:
         else:
             if solver.rhs_code == 1:
                 self.MUSCL(solver)
+            elif solver.rhs_code == 2:
+                self.WENO(solver)
+            elif solver.rhs_code == 3: #KEP
+                return
             else:
                 print('Other schems have not been implemented yet.')
                 exit()
         return
         
     def MUSCL(self,solver):
-        limiter_type = "vanleer"
+        limiter_type = "minmod"
 
         nxmax = solver.nxmax
         gamma = solver.gamma
-        order = 3
+        order = 2
         qc = solver.qc
         dx = solver.dx
         dt = solver.dt
@@ -420,7 +473,7 @@ class RHS:
 
         return 
     
-    def limiter(self, r, typ="vanleer"):
+    def limiter(self, r, typ="vanleer"): # For MUSCL
         if typ == "minmod":
             return np.maximum(0, np.minimum(1, r))
         elif typ == "superbee":
@@ -433,6 +486,148 @@ class RHS:
             # default (vanleer)
             return (r + np.abs(r)) / (1 + np.abs(r))
 
+    def WENO(self, solver):
+        nxmax = solver.nxmax
+        qc = solver.qc
+
+        """Convert interpolated- and conserved-variables (qc) to interpolated-primitive variables (prtv)."""
+        prtv = np.zeros_like(qc)
+        # Avoid division by zero by handling density carefully (rho > 0 in valid states)
+        rho = qc[0]
+        u = np.zeros_like(rho)
+        # Compute velocity where density is nonzero
+        nonzero = rho != 0
+        u[nonzero] = qc[1, nonzero] / rho[nonzero]
+        # Pressure from E, rho, u: p = (γ-1)*(E - 0.5*rho*u^2)
+        E = qc[2]
+        p = solver.gamma1 * (E - 0.5 * rho * u**2)
+        # Assign to primitive array
+        prtv[0] = rho
+        prtv[1] = u
+        prtv[2] = p
+
+        qL, qR = self.weno_characteristic_reconstruct_interface(qc,solver.gamma)
+        solver.prtvl = self.compute_intp_primitives(qL, solver)
+        solver.prtvr = self.compute_intp_primitives(qR, solver)
+
+        return
+
+    def weno_characteristic_reconstruct_interface(self, qc, gamma):
+        """
+        特性分解付きWENO界面再構成
+        qc: (3, N) 保存変数 [rho, rho*u, E]
+        gamma: 比熱比
+        返り値: qL, qR  (どちらも (3, N) で界面値が入る)
+        """
+        N = qc.shape[1]
+        qL = np.zeros_like(qc)
+        qR = np.zeros_like(qc)
+
+        # 2セル分 ghost cell 必須
+        for i in range(2, N-2):
+            # ステンシル(5点)を取り出し (各点: [rho, mom, ene])
+            stencil = qc[:, i-2:i+3]  # shape (3, 5)
+
+            # 平均状態（Roe平均が理想。ここでは簡単に算術平均でも可）
+            rho_mean = np.mean(stencil[0, :])
+            u_mean   = np.mean(stencil[1, :] / stencil[0, :])
+            E_mean   = np.mean(stencil[2, :])
+            p_mean   = (gamma-1) * (E_mean - 0.5 * rho_mean * u_mean**2)
+            H_mean   = (E_mean + p_mean) / rho_mean
+            a_mean   = np.sqrt(gamma * p_mean / rho_mean)
+
+            # 1D Eulerの右・左固有ベクトル
+            R = np.array([
+                [1,         1,        1],
+                [u_mean-a_mean, u_mean, u_mean+a_mean],
+                [H_mean-u_mean*a_mean, 0.5*u_mean**2, H_mean+u_mean*a_mean]
+            ])
+            # 逆行列で左固有ベクトル
+            L = np.linalg.inv(R)
+
+            # ステンシル5点を特性空間へ変換
+            w_stencil = L @ stencil  # (3,5)
+
+            # 各特性成分ごとにWENO再構成
+            wL = np.zeros(3)
+            wR = np.zeros(3)
+            for m in range(3):
+                fL, fR = self.weno5_reconstruct_interface(w_stencil[m, :])
+                wL[m] = fL[3]  # i+1/2 左側
+                wR[m] = fR[3]  # i+1/2 右側
+
+            # 保存変数空間に逆変換
+            qL[:, i+1] = R @ wL
+            qR[:, i+1] = R @ wR
+
+        # 境界部は元の値をそのまま（ghost cell運用必須）
+        qL[:, :3] = qc[:, :3]
+        qL[:, -3:] = qc[:, -3:]
+        qR[:, :3] = qc[:, :3]
+        qR[:, -3:] = qc[:, -3:]
+        return qL, qR
+
+    def weno5_reconstruct_interface(self, f):
+        """
+        WENO5 left/right interface reconstruction for a 1D array f.
+        Returns fL, fR: left and right states at each interface.
+        """
+        N = len(f)
+        fL = np.zeros(N)
+        fR = np.zeros(N)
+        eps = 1e-6
+
+        # Linear weights
+        g1, g2, g3 = 0.1, 0.6, 0.3
+
+        # Left-biased stencil for fL at i+1/2^-
+        for i in range(2, N-2):
+            # Left (i+1/2^-)
+            P1 = (2*f[i-2] - 7*f[i-1] + 11*f[i]) / 6.0
+            P2 = (-f[i-1] + 5*f[i] + 2*f[i+1]) / 6.0
+            P3 = (2*f[i] + 5*f[i+1] - f[i+2]) / 6.0
+
+            B1 = (13/12)*(f[i-2] - 2*f[i-1] + f[i])**2 + 0.25*(f[i-2] - 4*f[i-1] + 3*f[i])**2
+            B2 = (13/12)*(f[i-1] - 2*f[i] + f[i+1])**2 + 0.25*(f[i-1] - f[i+1])**2
+            B3 = (13/12)*(f[i] - 2*f[i+1] + f[i+2])**2 + 0.25*(3*f[i] - 4*f[i+1] + f[i+2])**2
+
+            a1 = g1 / (eps + B1)**2
+            a2 = g2 / (eps + B2)**2
+            a3 = g3 / (eps + B3)**2
+            wsum = a1 + a2 + a3
+            w1 = a1 / wsum
+            w2 = a2 / wsum
+            w3 = a3 / wsum
+
+            fL[i+1] = w1*P1 + w2*P2 + w3*P3
+
+            # Right (i+1/2^+): stencil mirrored
+            P1r = (2*f[i+2] - 7*f[i+1] + 11*f[i]) / 6.0
+            P2r = (-f[i+1] + 5*f[i] + 2*f[i-1]) / 6.0
+            P3r = (2*f[i] + 5*f[i-1] - f[i-2]) / 6.0
+
+            B1r = (13/12)*(f[i+2] - 2*f[i+1] + f[i])**2 + 0.25*(f[i+2] - 4*f[i+1] + 3*f[i])**2
+            B2r = (13/12)*(f[i+1] - 2*f[i] + f[i-1])**2 + 0.25*(f[i+1] - f[i-1])**2
+            B3r = (13/12)*(f[i] - 2*f[i-1] + f[i-2])**2 + 0.25*(3*f[i] - 4*f[i-1] + f[i-2])**2
+
+            a1r = g1 / (eps + B3r)**2
+            a2r = g2 / (eps + B2r)**2
+            a3r = g3 / (eps + B1r)**2
+            wsumr = a1r + a2r + a3r
+            w1r = a1r / wsumr
+            w2r = a2r / wsumr
+            w3r = a3r / wsumr
+
+            fR[i+1] = w1r*P3r + w2r*P2r + w3r*P1r  # 注: P3r,P2r,P1rの順
+
+        # Boundary: copy values or use lower order
+        fL[:3] = f[:3]
+        fL[-3:] = f[-3:]
+        fR[:3] = f[:3]
+        fR[-3:] = f[-3:]
+
+        return fL, fR
+        
     def compute_intp_primitives(self,qc,solver):
         """Convert interpolated- and conserved-variables (qc) to interpolated-primitive variables (prtv)."""
         prtv = np.zeros_like(qc)
@@ -452,30 +647,66 @@ class RHS:
 
         # Safety check for negative pressure or density (optional)
         if np.any(rho[1:solver.nxmax+1] < 0) or np.any(p[1:solver.nxmax+1] < 0):
+            print(rho)
+            print(p)
             raise RuntimeError("Negative density or pressure encountered in simulation!")
-
         return prtv
-        
+
 class LaxScheme:
-    """Lax-Friedrichs scheme (flux splitting with artificial dissipation)."""
+    """Lax-Friedrichs scheme (interface-flux form, compatible with Roe/SLAU interface)."""
     def step(self, solver):
         nx = solver.nxmax
-        # Compute flux at every node (including ghosts) using primitive vars
-        # Flux F = [ρu,  ρu^2 + p,  u*(E + p) ]
-        rho = solver.prtv[0]; u = solver.prtv[1]; p = solver.prtv[2]
-        E = p * solver.gamma1v + 0.5 * rho * u**2
-        # Compute flux arrays for all indices 0..nx+1
-        F0 = rho * u
-        F1 = rho * u**2 + p
-        F2 = (E + p) * u
-        # Compute flux divergence for each interior cell j = 1..nx
-        solver.dflx[:, 1:nx+1] = (np.array([F0, F1, F2])[:, 2:nx+2] - np.array([F0, F1, F2])[:, 0:nx]) / (2 * solver.dx)
-        # Update conserved variables: Q_new = 0.5*(Q[i-1] + Q[i+1]) - dt * (flux_diff)
-        # Using solver.qc_old (previous step state) for neighbor values
-        solver.qc[:, 1:nx+1] = 0.5 * (solver.qc_old[:, 0:nx] + solver.qc_old[:, 2:nx+2]) - solver.dt * solver.dflx[:, 1:nx+1]
-        # Compute max residual (e.g., density change)
-        res = np.max(np.abs(solver.dflx[0, 1:nx+1]))
-        return res
+        gamma = solver.gamma
+        gamma1v = solver.gamma1v
+        dx = solver.dx
+        dt = solver.dt
+
+        # prtvl and prtvr: primitive variables at left and right of each interface
+        prtvl = solver.prtvl  # shape (3, nx+2)
+        prtvr = solver.prtvr  # shape (3, nx+2)
+
+        qc = solver.qc
+        flux = np.zeros((3, nx+2))
+
+        # Compute local wave speed at each interface
+        rL = prtvl[0]; uL = prtvl[1]; pL = prtvl[2]
+        rR = prtvr[0]; uR = prtvr[1]; pR = prtvr[2]
+
+        aL = np.sqrt(gamma * pL / rL)
+        aR = np.sqrt(gamma * pR / rR)
+
+        alpha = np.maximum(np.abs(uL) + aL, np.abs(uR) + aR)  # maximum signal speed at each face
+
+        # Compute fluxes at each interface (face)
+        for j in range(1,nx+2):
+            # Left and right states at the interface
+            rL, uL, pL = prtvl[:, j-1]
+            rR, uR, pR = prtvr[:, j]
+
+            # Total energy for left and right
+            EL = pL * gamma1v + 0.5 * rL * uL ** 2
+            ER = pR * gamma1v + 0.5 * rR * uR ** 2
+
+            # Conserved variables for left and right
+            qL = np.array([rL, rL * uL, EL])
+            qR = np.array([rR, rR * uR, ER])
+
+            # Physical fluxes for left and right
+            FL = np.array([rL * uL, rL * uL ** 2 + pL, (EL + pL) * uL])
+            FR = np.array([rR * uR, rR * uR ** 2 + pR, (ER + pR) * uR])
+
+            # Lax-Friedrichs numerical flux at the interface
+            flux[:, j] = 0.5 * (FL + FR) - 0.5 * alpha[j] * (qR - qL)
+
+        # Flux difference for each cell (conservative update)
+        solver.dflx[:, 0:nx+1] = (flux[:, 1:nx+2] - flux[:, 0:nx+1]) / dx
+
+        # Update conserved variables in all interior cells (Rusanov type)
+        solver.qc[:, 1:nx+1] = solver.qc_old[:, 1:nx+1] - dt * solver.dflx[:, 1:nx+1]
+
+        # Return maximum density residual as convergence measure
+        res = np.max(np.abs(solver.dflx[0, 0:nx+1]))
+        return res       
         
 class LaxWendroffScheme:
     """Lax-Wendroff scheme (second-order, using flux Jacobian)."""
@@ -494,7 +725,7 @@ class LaxWendroffScheme:
         # Compute linearized flux Jacobian A at each half-step (interface) j = 1..nx+1
         for j in range(1, nx+2):
             # Left state (j-1) and right state (j)
-            rho_L, u_L, p_L = rho[j-1], u[j-1], p[j-1]
+            rho_L, u_L, pL = rho[j-1], u[j-1], p[j-1]
             rho_R, u_R, p_R = rho[j], u[j], p[j]
             # Average state at interface (midpoint)
             rho_half = 0.5 * (rho_L + rho_R)
@@ -602,212 +833,150 @@ class RoeScheme:
 
 class SLAUScheme:
     """
-    SLAU (Simple Low-dissipation AUSM) scheme for 1D Euler equations (Shima & Kitamura, JCP 2011).
+    SLAU (Simple Low-dissipation AUSM) scheme for 1D Euler equations.
+    Based on: Shima & Kitamura, AIAA 2009-136, JCP 2011, and standard Fortran implementations.
     """
     def step(self, solver):
         nx = solver.nxmax
-        gamma = solver.gamma
         dx = solver.dx
         dt = solver.dt
+        gamma = solver.gamma
+        gamma1v = 1.0 / (gamma - 1.0)
+
         qc = solver.qc
+        flux = np.zeros((3, nx + 2))  # [1, nx+1] interfaces
 
-        # New array for conserved variables (for update)
-        qc_new = np.zeros_like(qc)
-        flux = np.zeros((3, nx + 1))
+        # Loop over all interfaces (including ghost cells)
+        for j in range(1, nx + 2):
+            # --- Primitive states at the interface ---
+            rL = solver.prtvl[0, j - 1]
+            uL = solver.prtvl[1, j - 1]
+            pL = solver.prtvl[2, j - 1]
+            rR = solver.prtvr[0, j]
+            uR = solver.prtvr[1, j]
+            pR = solver.prtvr[2, j]
 
-        # Compute numerical fluxes including ghost cells
-        for i in range(nx + 1):
-            # left and right cell states
-            rho_L = qc[0, i]
-            u_L = qc[1, i] / rho_L
-            E_L = qc[2, i]
-            p_L = (gamma - 1) * (E_L - 0.5 * rho_L * u_L**2)
-            HL = (E_L + p_L) / rho_L
-            a_L = np.sqrt(gamma * p_L / rho_L)
+            # --- Sound speed ---
+            cL = np.sqrt(gamma * pL / rL)
+            cR = np.sqrt(gamma * pR / rR)
+            # --- Mean inverse sound speed (Fortran: cbv) ---
+            cbv = 2.0 / (cL + cR)
 
-            rho_R = qc[0, i+1]
-            u_R = qc[1, i+1] / rho_R
-            E_R = qc[2, i+1]
-            p_R = (gamma - 1) * (E_R - 0.5 * rho_R * u_R**2)
-            HR = (E_R + p_R) / rho_R
-            a_R = np.sqrt(gamma * p_R / rho_R)
+            # --- Mach numbers ---
+            xm1 = uL * cbv
+            xm2 = uR * cbv
 
-            # Reference soud speed at interface
-            a_face = min(a_L, a_R)
+            temp = 0.5 * (uL**2 + uR**2)
+            xmh = min(1.0, np.sqrt(temp) * cbv)
+            chi = (1.0 - xmh) ** 2
 
-            # mach number
-            M_L = u_L / a_face
-            M_R = u_R / a_face
+            # --- g, unb, un_p, un_m (Fortran: g, unb, un_p, un_m) ---
+            g = -max(min(xm1, 0.0), -1.0) * min(max(xm2, 0.0), 1.0)
+            unb = (rL * abs(uL) + rR * abs(uR)) / (rL + rR)
+            un_p = (1.0 - g) * abs(unb) + g * abs(uL)
+            un_m = (1.0 - g) * abs(unb) + g * abs(uR)
 
-            # SLAU interpolation : Mach number functions
-            def M_plus(M):   # for 0 ≦ M
-                return 0.25*(M+1)**2   if abs(M) < 1 else max(M, 0)
-            def M_minus(M): # for M ≦ 0
-                return -0.25*(M-1)**2  if abs(M) < 1 else min(M, 0)
+            # --- Mass flux (fm) ---
+            fm = 0.5 * (rL * (uL + un_p) + rR * (uR - un_m) - chi * (pR - pL) * cbv)
+            fmL = 0.5 * (fm + abs(fm))
+            fmR = 0.5 * (fm - abs(fm))
 
-            # Convective mass flux (Shima 2011 eqn. (23))
-            mass_flux = a_face * (rho_L * M_plus(M_L) + rho_R * M_minus(M_R))
+            # --- beta+ (left), beta- (right) as in paper ---
+            sw1 = 1.0 if abs(xm1) > 1.0 else 0.0
+            sw2 = 1.0 if abs(xm2) > 1.0 else 0.0
+            sgn_xm1 = 1.0 if xm1 >= 0 else -1.0
+            sgn_xm2 = 1.0 if xm2 >= 0 else -1.0
 
-            # Pressure flux: (Shima 2011 eqn. (27))
-            alpha = 0.1875  # recommended value in the paper (can be tuned)
-            beta = 0.125
-            f_p = 0.5 * (1 + np.sign(M_L) * (1 - 2 * alpha * M_L * M_R))
-            pressure_flux = f_p * p_L + (1 - f_p) * p_R
+            betaL = (1.0 - sw1) * 0.25 * (2.0 - xm1) * (xm1 + 1.0) ** 2 + sw1 * 0.5 * (1.0 + sgn_xm1)
+            betaR = (1.0 - sw2) * 0.25 * (2.0 + xm2) * (xm2 - 1.0) ** 2 + sw2 * 0.5 * (1.0 - sgn_xm2)
 
-            # Additional term : pressure smooting
-            phi = 0.5 * (1 + np.tanh(beta * (M_L - M_R)))
-            pressure_flux = phi * p_L + (1 - phi) * p_R
+            # --- Pressure flux (FVS type, eqn. 32 in AIAA 2009-136) ---
+            pbar = 0.5 * ((pL + pR) + (betaL - betaR) * (pL - pR) + (1.0 - chi) * (betaL + betaR - 1.0) * (pL + pR))
 
-            # Numerical fluxes for conserved variables
-            # F = [mass, momentum, energy]
-            flux[0, i] = mass_flux
-            flux[1, i] = mass_flux * ((u_L if mass_flux > 0 else u_R)) + pressure_flux
-            flux[2, i] = mass_flux * ((HL if mass_flux > 0 else HR))
+            # --- Specific enthalpy (for energy flux) ---
+            HL = cL**2 * gamma1v + 0.5 * uL**2
+            HR = cR**2 * gamma1v + 0.5 * uR**2
 
-        # Update conserved variables for interior points only (boundaries are handled externally)
-        for j in range(1, nx + 1):
-            qc_new[:, j] = qc[:, j] - dt/dx * (flux[:, j] - flux[:, j-1])
+            # --- Fluxes ---
+            flux[0, j] = fmL + fmR
+            flux[1, j] = fmL * uL + fmR * uR + pbar
+            flux[2, j] = fmL * HL + fmR * HR
 
-        # Update solver state
-        solver.qc[:, 1:nx+1] = qc_new[:, 1:nx+1]
-        res = np.linalg.norm(qc_new - qc)
+        # --- Flux divergence and conserved variable update ---
+        solver.dflx[:, 1:nx+1] = (flux[:, 2:nx+2] - flux[:, 1:nx+1]) / dx
+        solver.qc[:, 1:nx+1] = solver.qc_old[:, 1:nx+1] - dt * solver.dflx[:, 1:nx+1]
+
+        res = np.max(np.abs(solver.dflx[0, 1:nx+1]))
         return res
-
-
-class WENOScheme:
-    """
-    5次精度WENOスキームによる数値流束
-    SodShockTubeSolverクラスで scheme_code=4 で呼ばれる
-    """
-    def step(self, solver):
-        # 変数の省略形
-        nx = solver.nxmax
-        gamma = solver.gamma
-
-        # 保存変数配列
-        qc = solver.qc
-        dt = solver.dt
-        dx = solver.dx
-
-        # 新しい保存変数（出力用）
-        qc_new = np.zeros_like(qc)
-
-        # 各成分（ρ, ρu, E）ごとにWENO補間で流束Fを計算
-        for k in range(3):
-            F = self.compute_flux(qc, k, gamma)
-            F_face = self.weno5_reconstruction(F)
-
-            # 半陰的ループ（i=2からi=nx-1まで：ゴーストセル考慮）
-            for i in range(2, nx):
-                qc_new[k, i] = qc[k, i] - dt/dx * (F_face[i] - F_face[i-1])
-
-        # 更新
-        solver.qc = qc_new
-        return np.linalg.norm(qc_new - qc)
-
-    def compute_flux(self, qc, k, gamma):
-        """保存変数から流束計算"""
-        rho = qc[0, :]
-        u = qc[1, :] / rho
-        E = qc[2, :]
-        p = (gamma - 1.0) * (E - 0.5 * rho * u ** 2)
-        F = np.zeros_like(rho)
-
-        if k == 0:
-            F = qc[1, :]  # ρu
-        elif k == 1:
-            F = qc[1, :] * u + p
-        elif k == 2:
-            F = (E + p) * u
-        return F
-
-    def weno5_reconstruction(self, F):
-        """WENO5による界面流束の再構成（一次元, L→R）"""
-        eps = 1e-6
-        nx = len(F)
-        F_face = np.zeros(nx)
-
-        # i-1, i, i+1, i+2, i+3が使えるよう2セル余分にとる
-        for i in range(2, nx-2):
-            # 3つの候補Stencil
-            f1 = (2*F[i-2] - 7*F[i-1] + 11*F[i]) / 6.0
-            f2 = (-F[i-1] + 5*F[i] + 2*F[i+1]) / 6.0
-            f3 = (2*F[i] + 5*F[i+1] - F[i+2]) / 6.0
-
-            # 平滑化指標
-            b1 = 13/12 * (F[i-2] - 2*F[i-1] + F[i])**2 + 1/4 * (F[i-2] - 4*F[i-1] + 3*F[i])**2
-            b2 = 13/12 * (F[i-1] - 2*F[i] + F[i+1])**2 + 1/4 * (F[i-1] - F[i+1])**2
-            b3 = 13/12 * (F[i] - 2*F[i+1] + F[i+2])**2 + 1/4 * (3*F[i] - 4*F[i+1] + F[i+2])**2
-
-            # 非線形重み
-            a1 = 0.1 / (eps + b1)**2
-            a2 = 0.6 / (eps + b2)**2
-            a3 = 0.3 / (eps + b3)**2
-            wsum = a1 + a2 + a3
-            w1 = a1 / wsum
-            w2 = a2 / wsum
-            w3 = a3 / wsum
-
-            # WENO再構成
-            F_face[i] = w1 * f1 + w2 * f2 + w3 * f3
-
-        # 両端は単純コピー
-        F_face[:2] = F[:2]
-        F_face[-2:] = F[-2:]
-        return F_face
-
 
 class KEPScheme:
     """
-    厳密なKinetic Energy Preserving (KEP) スキーム（Jameson 2008, 2012に基づく）
-    スキュー対称中心差分によるオイラー方程式の離散化
+    Kinetic-Energy-Preserving central scheme + Jameson shock-capturing viscosity with sensor.
+    Reference(KEP): Jameson 2008
+    Reference(Shock-capturing): Jameson et al., 1981; Shu 1997; 多数のCFD shock-capturing教科書
     """
-
     def step(self, solver):
         nx = solver.nxmax
-        gamma = solver.gamma
-        qc = solver.qc
-        dt = solver.dt
         dx = solver.dx
+        dt = solver.dt
+        gamma = solver.gamma
+        gamma1v = solver.gamma1v
 
-        qc_new = np.zeros_like(qc)
-        # ゴーストセル考慮：1～nxまで更新
-        for i in range(1, nx+1):
-            # 中心差分で数値流束を計算
-            fluxR = self.euler_flux(qc[:, i+1], gamma)
-            fluxL = self.euler_flux(qc[:, i-1], gamma)
-            fluxC = self.euler_flux(qc[:, i],   gamma)
+        qc = solver.qc
+        flux = np.zeros((3, nx+1))
 
-            # Jameson型スキュー対称形式
-            # F_{i+1/2} + F_{i-1/2} - F_i のように組み合わせる
-            for k in range(3):
-                # KEP: 0.25*[F(Q_{i+1}) + F(Q_i)] - 0.25*[F(Q_{i}) + F(Q_{i-1})]
-                dF = 0.25*(self.euler_flux(qc[:,i+1],gamma)[k] + self.euler_flux(qc[:,i],gamma)[k]) \
-                    - 0.25*(self.euler_flux(qc[:,i],gamma)[k] + self.euler_flux(qc[:,i-1],gamma)[k])
-                qc_new[k, i] = qc[k, i] - dt/dx * dF
+        # --- 1. Physical flux at cell centers
+        rho = qc[0]
+        u = qc[1] / rho
+        E = qc[2]
+        p = (E - 0.5 * rho * u**2) / gamma1v
+        F = np.zeros_like(qc)
+        F[0] = rho * u
+        F[1] = rho * u**2 + p
+        F[2] = u * (E + p)
 
-        # 境界（ゴースト）セルはそのまま
-        qc_new[:, 0] = qc[:, 0]
-        qc_new[:, nx+1] = qc[:, nx+1]
-        solver.qc = qc_new
-        return np.linalg.norm(qc_new - qc)
+        # --- 2. Central flux at interfaces (skew-symmetric/KEP)
+        for j in range(nx+1):
+            F_left = F[:, j]
+            F_right = F[:, j+1]
+            flux[:, j] = 0.5 * (F_left + F_right)
 
-    @staticmethod
-    def euler_flux(Q, gamma):
-        """保存変数 Q = [rho, rho*u, E] から流束 [rho*u, rho*u^2 + p, u*(E+p)] を返す"""
-        rho = Q[0]
-        u = Q[1] / rho
-        E = Q[2]
-        p = (gamma - 1.0) * (E - 0.5 * rho * u**2)
-        return np.array([
-            Q[1],               # rho*u
-            Q[1] * u + p,       # rho*u^2 + p
-            (E + p) * u         # u*(E + p)
-        ])
+        # --- 3. Compute sensor for artificial viscosity ---
+        # Sensor based on density gradient (local shock indicator)
+        sensor = np.zeros(nx+2)
+        beta = 1.0  # sensor sharpness
+        for j in range(2, nx):
+            # 1. ショックセンサー: 密度2次差分/1次差分の比
+            numerator = np.abs(qc[0, j+1] - 2*qc[0, j] + qc[0, j-1])
+            denominator = np.abs(qc[0, j+1] - qc[0, j-1]) + 1e-12
+            s = numerator / denominator
+            # Optionally raise to some power or scale, betaで調整
+            sensor[j] = np.tanh(beta * s)
 
+        # --- 4. Apply artificial viscosity with sensor ---
+        eps2_base = 0.4
+        eps4_base = 0.02
+        Q_visc = np.zeros_like(qc)
+        for m in range(3):
+            # 2nd-order sensor-weighted
+            d2 = qc[m, :-2] - 2 * qc[m, 1:-1] + qc[m, 2:]
+            # 4th-order sensor-weighted
+            d4 = qc[m, :-4] - 4 * qc[m, 1:-3] + 6 * qc[m, 2:-2] - 4 * qc[m, 3:-1] + qc[m, 4:]
+            # センサー値の利用: ショック付近は強め、滑らか領域は弱め
+            # 2nd: センサーで直接重み付け
+            Q_visc[m, 2:-2] = eps2_base * sensor[2:-2] * d2[1:-1] - eps4_base * d4
 
-import numpy as np
+        # --- 5. Conservative update ---
+        solver.dflx[:, 1:nx+1] = (flux[:, 1:nx+1] - flux[:, 0:nx]) / dx
+        solver.qc[:, 1:nx+1] = (
+            solver.qc_old[:, 1:nx+1]
+            - dt * solver.dflx[:, 1:nx+1]
+            + dt / dx * (Q_visc[:, 1:nx+1] - Q_visc[:, 0:nx])
+        )
 
+        res = np.max(np.abs(solver.dflx[0, 1:nx+1]))
+        return res
+    
 class KEEPScheme:
     """
     Kuya & Kawai (2023) KEEP scheme for 1D Euler equations.
@@ -864,3 +1033,59 @@ class KEEPScheme:
             solver.qc[:, j] = solver.qc_old[:, j] - (solver.dt / solver.dx) * dF
             res += np.sum(np.abs(dF))
         return res
+
+
+class LHS:
+    """
+    LHS (Left-Hand Side) class for time integration.
+    Provides TVD-RK1 (Euler), TVD-RK2, and TVD-RK3 integrators.
+    """
+
+    def tvd_rk1(self, solver, scheme):
+        """
+        TVD-RK1 = Forward Euler.
+        Updates solver.qc in place.
+        """
+        res = scheme.step(solver)
+        return res
+        
+    def tvd_rk2(self, solver, scheme):
+        """
+        TVD-RK2 (Heun/modified midpoint method).
+        Updates solver.qc in place.
+        """
+        qc0 = solver.qc.copy()
+
+        # Stage 1
+        solver.qc = qc0.copy()
+        res1 = scheme.step(solver)
+        qc1 = solver.qc.copy()
+
+        # Stage 2
+        solver.qc = 0.5 * qc0 + 0.5 * qc1
+        res2 = scheme.step(solver)
+        # Now solver.qc is at t^{n+1}
+        return res2
+    
+    def tvd_rk3(self, solver, scheme):
+        """
+        TVD-RK3 (Shu-Osher 3rd order) integrator.
+        Updates solver.qc in place.
+        """
+        qc0 = solver.qc.copy()   # Save initial state
+
+        # Stage 1
+        solver.qc = qc0.copy()
+        res1 = scheme.step(solver)
+        qc1 = solver.qc.copy()
+
+        # Stage 2
+        solver.qc = 0.75 * qc0 + 0.25 * qc1
+        res2 = scheme.step(solver)
+        qc2 = solver.qc.copy()
+
+        # Stage 3
+        solver.qc = (1.0/3.0) * qc0 + (2.0/3.0) * qc2
+        res3 = scheme.step(solver)
+        # Now solver.qc is at t^{n+1}
+        return res3

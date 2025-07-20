@@ -8,7 +8,7 @@ Updated by:May 2025
 import argparse
 import configparser
 import os
-from solver import SodShockTubeSolver,InitialCondition,BoundaryCondition,RHS
+from solver import SodShockTubeSolver,InitialCondition,BoundaryCondition,RHS,LHS
 
 
 if __name__ == "__main__":
@@ -37,11 +37,12 @@ if __name__ == "__main__":
         init_cond = InitialCondition()
         boundary = BoundaryCondition()
         rhs = RHS()
+        lhs = LHS()
         # Write initial configuration to log
         log_file.write("Configuration Parameters:\n")
         for key in config:
             log_file.write(f"  {key} = {config.get(key)}\n")
         log_file.write("\n")
         # Run the simulation
-        solver.run(init_cond, boundary, rhs, log_file)
+        solver.run(init_cond, boundary, rhs, lhs, log_file)
         print(f"Simulation finished. See '{log_file_path}' for log and 'output/' for results.")
